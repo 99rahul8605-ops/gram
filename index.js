@@ -51,10 +51,6 @@ async function deleteSession(userId) {
   await sessionsCol.deleteOne({ userId });
 }
 
-async function getAllSessions() {
-  return await sessionsCol.find().toArray();
-}
-
 // ─────────────────────────────────────────────────────────
 //  Notify owner on OTP / service account message
 // ─────────────────────────────────────────────────────────
@@ -63,6 +59,19 @@ gm.setNotify(async (userId, text) => {
     await bot.api.sendMessage(userId, text, { parse_mode: 'HTML' });
   } catch (err) {
     console.error('[notify] failed:', err.message);
+  }
+});
+
+// ─────────────────────────────────────────────────────────
+//  Error handler — prevents bot from crashing on any error
+// ─────────────────────────────────────────────────────────
+bot.catch((err) => {
+  const ctx = err.ctx;
+  console.error(`❌ Error while handling update ${ctx?.update?.update_id}:`);
+  console.error(err.error?.message || err.message);
+  // Try to notify the owner in chat (best-effort)
+  if (ctx?.chat?.id) {
+    ctx.reply('⚠️ Something went wrong. Please try again.').catch(() => {});
   }
 });
 
@@ -107,7 +116,9 @@ bot.command('start', async (ctx) => {
 // ─────────────────────────────────────────────────────────
 bot.callbackQuery('acc:me', async (ctx) => {
   await ctx.answerCallbackQuery();
-  if (!gm.isConnected(OWNER_ID)) return ctx.editMessageText('⚠️ Not connected. Use /login first.', { reply_markup: mainMenu() });
+  if (!gm.isConnected(OWNER_ID)) {
+    return ctx.editMessageText('⚠️ Not connected. Use /login first.', { reply_markup: mainMenu() });
+  }
   try {
     const me = await gm.getMe(OWNER_ID);
     const phone = me.phone ? `+${me.phone}` : '— (hidden by privacy)';
@@ -123,13 +134,15 @@ bot.callbackQuery('acc:me', async (ctx) => {
       { parse_mode: 'HTML', reply_markup: mainMenu() }
     );
   } catch (err) {
-    await ctx.editMessageText(`❌ ${err.message}`, { reply_markup: mainMenu() });
+    await ctx.editMessageText(`❌ ${escapeHtml(err.message)}`, { reply_markup: mainMenu() });
   }
 });
 
 bot.callbackQuery('acc:groups', async (ctx) => {
   await ctx.answerCallbackQuery();
-  if (!gm.isConnected(OWNER_ID)) return ctx.editMessageText('⚠️ Not connected. Use /login first.', { reply_markup: mainMenu() });
+  if (!gm.isConnected(OWNER_ID)) {
+    return ctx.editMessageText('⚠️ Not connected. Use /login first.', { reply_markup: mainMenu() });
+  }
 
   await ctx.editMessageText('⏳ Loading your groups and channels...');
   try {
@@ -179,7 +192,6 @@ bot.callbackQuery('acc:groups', async (ctx) => {
       }
     }
 
-    // Telegram message length cap
     if (text.length > 4000) {
       text = text.slice(0, 3900) + '\n\n<i>(truncated)</i>';
     }
@@ -267,6 +279,7 @@ bot.command('status', async (ctx) => {
 
 // ─────────────────────────────────────────────────────────
 //  Text handler — session string input
+//  ✅ FIXED: use ctx.api.editMessageText instead of message.editText
 // ─────────────────────────────────────────────────────────
 bot.on('message:text', async (ctx, next) => {
   const text = (ctx.message.text || '').trim();
@@ -295,7 +308,9 @@ bot.on('message:text', async (ctx, next) => {
     const me = await client.getMe();
     await saveSession(OWNER_ID, text);
 
-    await loading.editText(
+    await ctx.api.editMessageText(
+      loading.chat.id,
+      loading.message_id,
       '✅ <b>Connected successfully!</b>\n\n' +
         `👤 ${escapeHtml([me.firstName, me.lastName].filter(Boolean).join(' ') || '—')}\n` +
         `🆔 <code>${me.id}</code>\n\n` +
@@ -303,7 +318,12 @@ bot.on('message:text', async (ctx, next) => {
       { parse_mode: 'HTML', reply_markup: mainMenu() }
     );
   } catch (err) {
-    await loading.editText(`❌ <b>Login failed</b>\n\n${escapeHtml(err.message)}`, { parse_mode: 'HTML' });
+    await ctx.api.editMessageText(
+      loading.chat.id,
+      loading.message_id,
+      `❌ <b>Login failed</b>\n\n${escapeHtml(err.message)}`,
+      { parse_mode: 'HTML' }
+    );
   }
 });
 
