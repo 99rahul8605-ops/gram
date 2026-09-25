@@ -22,6 +22,7 @@ const mongo = new MongoClient(MONGO_URI);
 const gm = new GramJSManager(API_ID, API_HASH);
 
 let sessionsCol;
+let sudoCol;
 
 // ─────────────────────────────────────────────────────────
 //  DB
@@ -30,7 +31,9 @@ async function initDb() {
   await mongo.connect();
   const db = mongo.db(MONGO_DB);
   sessionsCol = db.collection('sessions');
+  sudoCol = db.collection('sudo_users');
   await sessionsCol.createIndex({ userId: 1 }, { unique: true });
+  await sudoCol.createIndex({ userId: 1 }, { unique: true });
   console.log('✅ MongoDB connected');
 }
 
@@ -51,35 +54,75 @@ async function deleteSession(userId) {
   await sessionsCol.deleteOne({ userId });
 }
 
+async function getAllSessions() {
+  return await sessionsCol.find().toArray();
+}
+
+// ───── Sudo users ─────
+async function isSudo(userId) {
+  if (userId === OWNER_ID) return true;
+  const doc = await sudoCol.findOne({ userId });
+  return Boolean(doc);
+}
+
+async function addSudo(userId, addedBy) {
+  await sudoCol.updateOne(
+    { userId },
+    { $set: { userId, addedBy, addedAt: new Date() } },
+    { upsert: true }
+  );
+}
+
+async function removeSudo(userId) {
+  const res = await sudoCol.deleteOne({ userId });
+  return res.deletedCount > 0;
+}
+
+async function listSudo() {
+  return await sudoCol.find().toArray();
+}
+
 // ─────────────────────────────────────────────────────────
-//  Notify owner on OTP / service account message
+//  Notify function — sends message to the correct user
 // ─────────────────────────────────────────────────────────
 gm.setNotify(async (userId, text) => {
   try {
     await bot.api.sendMessage(userId, text, { parse_mode: 'HTML' });
   } catch (err) {
-    console.error('[notify] failed:', err.message);
+    console.error(`[notify] failed for ${userId}:`, err.message);
   }
 });
 
 // ─────────────────────────────────────────────────────────
-//  Error handler — prevents bot from crashing on any error
+//  Error handler
 // ─────────────────────────────────────────────────────────
 bot.catch((err) => {
   const ctx = err.ctx;
   console.error(`❌ Error while handling update ${ctx?.update?.update_id}:`);
   console.error(err.error?.message || err.message);
-  // Try to notify the owner in chat (best-effort)
   if (ctx?.chat?.id) {
     ctx.reply('⚠️ Something went wrong. Please try again.').catch(() => {});
   }
 });
 
 // ─────────────────────────────────────────────────────────
-//  Middleware — only owner can use
+//  Middleware — owner OR sudo users only
 // ─────────────────────────────────────────────────────────
 bot.use(async (ctx, next) => {
-  if (ctx.from?.id !== OWNER_ID) {
+  const uid = ctx.from?.id;
+  if (!uid) return;
+
+  // Allow /addsudo and /rmsudo only for the main OWNER (not sudo users).
+  const text = ctx.message?.text || '';
+  if (text.startsWith('/addsudo') || text.startsWith('/rmsudo') || text.startsWith('/listsudo')) {
+    if (uid !== OWNER_ID) {
+      return ctx.reply('⛔️ Only the main owner can manage sudo users.');
+    }
+    return next();
+  }
+
+  const allowed = await isSudo(uid);
+  if (!allowed) {
     return ctx.reply('⛔️ This bot is private.');
   }
   return next();
@@ -100,11 +143,13 @@ function mainMenu() {
 //  /start
 // ─────────────────────────────────────────────────────────
 bot.command('start', async (ctx) => {
-  const connected = gm.isConnected(OWNER_ID);
+  const uid = ctx.from.id;
+  const connected = gm.isConnected(uid);
   const status = connected ? '🟢 <b>Connected</b>' : '🔴 <b>Not connected</b>';
+  const isOwner = uid === OWNER_ID ? ' 👑' : '';
 
   await ctx.reply(
-    '👋 <b>GramJS Account Controller</b>\n\n' +
+    `👋 <b>GramJS Account Controller</b>${isOwner}\n\n` +
       `Status: ${status}\n\n` +
       'What would you like to do?',
     { parse_mode: 'HTML', reply_markup: mainMenu() }
@@ -112,15 +157,16 @@ bot.command('start', async (ctx) => {
 });
 
 // ─────────────────────────────────────────────────────────
-//  Callback router
+//  Callback router — uses ctx.from.id (per-user)
 // ─────────────────────────────────────────────────────────
 bot.callbackQuery('acc:me', async (ctx) => {
   await ctx.answerCallbackQuery();
-  if (!gm.isConnected(OWNER_ID)) {
+  const uid = ctx.from.id;
+  if (!gm.isConnected(uid)) {
     return ctx.editMessageText('⚠️ Not connected. Use /login first.', { reply_markup: mainMenu() });
   }
   try {
-    const me = await gm.getMe(OWNER_ID);
+    const me = await gm.getMe(uid);
     const phone = me.phone ? `+${me.phone}` : '— (hidden by privacy)';
     const username = me.username ? `@${me.username}` : '—';
     const name = [me.firstName, me.lastName].filter(Boolean).join(' ') || '—';
@@ -140,13 +186,14 @@ bot.callbackQuery('acc:me', async (ctx) => {
 
 bot.callbackQuery('acc:groups', async (ctx) => {
   await ctx.answerCallbackQuery();
-  if (!gm.isConnected(OWNER_ID)) {
+  const uid = ctx.from.id;
+  if (!gm.isConnected(uid)) {
     return ctx.editMessageText('⚠️ Not connected. Use /login first.', { reply_markup: mainMenu() });
   }
 
   await ctx.editMessageText('⏳ Loading your groups and channels...');
   try {
-    const dialogs = await gm.getDialogs(OWNER_ID);
+    const dialogs = await gm.getDialogs(uid);
     const groups = [];
     const channels = [];
 
@@ -214,8 +261,9 @@ bot.callbackQuery('acc:login', async (ctx) => {
 
 bot.callbackQuery('acc:logout', async (ctx) => {
   await ctx.answerCallbackQuery();
-  await gm.disconnect(OWNER_ID);
-  await deleteSession(OWNER_ID);
+  const uid = ctx.from.id;
+  await gm.disconnect(uid);
+  await deleteSession(uid);
   await ctx.editMessageText(
     '✅ Logged out and session removed.',
     { reply_markup: mainMenu() }
@@ -234,9 +282,10 @@ bot.command('login', async (ctx) => {
 });
 
 bot.command('me', async (ctx) => {
-  if (!gm.isConnected(OWNER_ID)) return ctx.reply('⚠️ Not connected. Use /login.');
+  const uid = ctx.from.id;
+  if (!gm.isConnected(uid)) return ctx.reply('⚠️ Not connected. Use /login.');
   try {
-    const me = await gm.getMe(OWNER_ID);
+    const me = await gm.getMe(uid);
     const phone = me.phone ? `+${me.phone}` : '—';
     const username = me.username ? `@${me.username}` : '—';
     const name = [me.firstName, me.lastName].filter(Boolean).join(' ') || '—';
@@ -254,9 +303,10 @@ bot.command('me', async (ctx) => {
 });
 
 bot.command('groups', async (ctx) => {
-  if (!gm.isConnected(OWNER_ID)) return ctx.reply('⚠️ Not connected. Use /login.');
+  const uid = ctx.from.id;
+  if (!gm.isConnected(uid)) return ctx.reply('⚠️ Not connected. Use /login.');
   try {
-    const dialogs = await gm.getDialogs(OWNER_ID);
+    const dialogs = await gm.getDialogs(uid);
     const total = dialogs.filter((d) => d.isGroup || d.isChannel).length;
     await ctx.reply(`📊 You are in <b>${total}</b> groups and channels.`, { parse_mode: 'HTML' });
   } catch (err) {
@@ -265,32 +315,113 @@ bot.command('groups', async (ctx) => {
 });
 
 bot.command('logout', async (ctx) => {
-  await gm.disconnect(OWNER_ID);
-  await deleteSession(OWNER_ID);
+  const uid = ctx.from.id;
+  await gm.disconnect(uid);
+  await deleteSession(uid);
   await ctx.reply('✅ Logged out and session removed.');
 });
 
 bot.command('status', async (ctx) => {
+  const uid = ctx.from.id;
   await ctx.reply(
-    `Status: ${gm.isConnected(OWNER_ID) ? '🟢 Connected' : '🔴 Not connected'}`,
+    `Status: ${gm.isConnected(uid) ? '🟢 Connected' : '🔴 Not connected'}`,
     { reply_markup: mainMenu() }
   );
 });
 
 // ─────────────────────────────────────────────────────────
-//  Text handler — session string input
-//  ✅ FIXED: use ctx.api.editMessageText instead of message.editText
+//  Sudo management (OWNER only)
+// ─────────────────────────────────────────────────────────
+bot.command('addsudo', async (ctx) => {
+  const args = (ctx.match || '').trim().split(/\s+/).filter(Boolean);
+  if (!args[0]) {
+    return ctx.reply(
+      '📝 <b>Usage:</b> <code>/addsudo &lt;user_id&gt;</code>\n\n' +
+        'Get the user ID from @userinfobot and paste it here.',
+      { parse_mode: 'HTML' }
+    );
+  }
+  const target = Number(args[0]);
+  if (!Number.isSafeInteger(target)) {
+    return ctx.reply('❌ Invalid user ID. Must be a number.');
+  }
+  if (target === OWNER_ID) {
+    return ctx.reply('ℹ️ This user is already the main owner.');
+  }
+  const existing = await sudoCol.findOne({ userId: target });
+  if (existing) {
+    return ctx.reply(`ℹ️ User <code>${target}</code> is already a sudo user.`, { parse_mode: 'HTML' });
+  }
+  await addSudo(target, ctx.from.id);
+  await ctx.reply(
+    `✅ <b>Sudo user added</b>\n\n` +
+      `🆔 <code>${target}</code>\n\n` +
+      `They can now use the bot with their own Telegram account.`,
+    { parse_mode: 'HTML' }
+  );
+  // Notify the new sudo user (best-effort)
+  try {
+    await bot.api.sendMessage(
+      target,
+      '🎉 You have been granted access to the GramJS Account Controller bot.\n\nSend /start to begin.'
+    );
+  } catch {}
+});
+
+bot.command('rmsudo', async (ctx) => {
+  const args = (ctx.match || '').trim().split(/\s+/).filter(Boolean);
+  if (!args[0]) {
+    return ctx.reply(
+      '📝 <b>Usage:</b> <code>/rmsudo &lt;user_id&gt;</code>',
+      { parse_mode: 'HTML' }
+    );
+  }
+  const target = Number(args[0]);
+  if (!Number.isSafeInteger(target)) {
+    return ctx.reply('❌ Invalid user ID.');
+  }
+  if (target === OWNER_ID) {
+    return ctx.reply('⚠️ Cannot remove the main owner.');
+  }
+  const removed = await removeSudo(target);
+  if (!removed) {
+    return ctx.reply(`ℹ️ User <code>${target}</code> is not a sudo user.`, { parse_mode: 'HTML' });
+  }
+  // Also disconnect their session, if any
+  await gm.disconnect(target).catch(() => {});
+  await deleteSession(target);
+  await ctx.reply(
+    `✅ <b>Sudo user removed</b>\n\n🆔 <code>${target}</code>`,
+    { parse_mode: 'HTML' }
+  );
+});
+
+bot.command('listsudo', async (ctx) => {
+  const rows = await listSudo();
+  let text = '👑 <b>Sudo Users</b>\n\n';
+  text += `• <code>${OWNER_ID}</code> — <b>Main Owner</b>\n`;
+  if (rows.length) {
+    for (const r of rows) {
+      text += `• <code>${r.userId}</code>\n`;
+    }
+  } else {
+    text += '\n<i>No additional sudo users.</i>';
+  }
+  await ctx.reply(text, { parse_mode: 'HTML' });
+});
+
+// ─────────────────────────────────────────────────────────
+//  Text handler — session string input (per-user)
 // ─────────────────────────────────────────────────────────
 bot.on('message:text', async (ctx, next) => {
   const text = (ctx.message.text || '').trim();
 
-  // Don't intercept commands
   if (text.startsWith('/')) return next();
 
-  // Session strings are typically 300-400 chars of base64-ish text.
   const looksLikeSession = text.length >= 100 && /^[A-Za-z0-9+/=_-]+$/.test(text);
-
   if (!looksLikeSession) return next();
+
+  const uid = ctx.from.id;
 
   // Delete the message from chat immediately (security)
   try { await ctx.deleteMessage(); } catch {}
@@ -298,7 +429,7 @@ bot.on('message:text', async (ctx, next) => {
   const loading = await ctx.reply('⏳ Connecting with your session...');
 
   try {
-    const client = await gm.connect(OWNER_ID, text);
+    const client = await gm.connect(uid, text);
 
     // Re-register notify so OTP works
     gm.setNotify(async (userId, msg) => {
@@ -306,7 +437,7 @@ bot.on('message:text', async (ctx, next) => {
     });
 
     const me = await client.getMe();
-    await saveSession(OWNER_ID, text);
+    await saveSession(uid, text);
 
     await ctx.api.editMessageText(
       loading.chat.id,
@@ -343,14 +474,17 @@ function escapeHtml(s) {
 async function boot() {
   await initDb();
 
-  // Auto-reconnect saved session
-  const saved = await loadSession(OWNER_ID);
-  if (saved) {
-    try {
-      await gm.connect(OWNER_ID, saved);
-      console.log('🔌 Reconnected saved session');
-    } catch (err) {
-      console.warn('⚠️ Saved session failed to reconnect:', err.message);
+  // Auto-reconnect ALL saved sessions
+  const allSessions = await getAllSessions();
+  if (allSessions.length) {
+    console.log(`🔌 Reconnecting ${allSessions.length} saved session(s)...`);
+    for (const s of allSessions) {
+      try {
+        await gm.connect(s.userId, s.sessionString);
+        console.log(`   ✅ Reconnected ${s.userId}`);
+      } catch (err) {
+        console.warn(`   ⚠️ Failed for ${s.userId}: ${err.message}`);
+      }
     }
   }
 
@@ -361,6 +495,9 @@ async function boot() {
     { command: 'groups', description: 'Count groups & channels' },
     { command: 'status', description: 'Connection status' },
     { command: 'logout', description: 'Disconnect session' },
+    { command: 'addsudo', description: 'Add sudo user (owner only)' },
+    { command: 'rmsudo', description: 'Remove sudo user (owner only)' },
+    { command: 'listsudo', description: 'List sudo users (owner only)' },
   ]);
 
   console.log('🤖 Bot starting...');
